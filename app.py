@@ -1,3 +1,4 @@
+# v3 - image-based X+Y detection, idempotent
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import fitz, re, io, base64
