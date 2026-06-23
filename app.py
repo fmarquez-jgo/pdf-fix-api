@@ -7,52 +7,75 @@ import numpy as np
 app = Flask(__name__)
 CORS(app)
 
-def get_thumbs(arr, x0, ancho, scale, n):
+def detect_thumb_x_columns(arr, scale, page_width):
+    x_start = int(page_width * 0.65 * scale)
+    col_density = (arr[:, x_start:, :].min(axis=2) < 150).sum(axis=0)
+    threshold = max(col_density) * 0.25 if col_density.max() > 0 else 1
+    in_peak = False; peaks = []
+    for i, v in enumerate(col_density):
+        if v > threshold and not in_peak: in_peak = True; p0 = i
+        elif v <= threshold and in_peak:
+            in_peak = False
+            peaks.append((x_start + (p0 + i) // 2) / scale)
+    return peaks
+
+def detect_thumb_y_rows(arr, scale, x_cols):
     best = []
-    for off in [0, 27, 55, 82, 110, 137]:
-        xc = max(0, int((x0 + off) * scale))
-        xe = min(arr.shape[1], xc + int(ancho * scale))
-        if xe <= xc: continue
+    for xc_pt in x_cols[:4]:
+        xc = max(0, int(xc_pt * scale) - int(8 * scale))
+        xe = min(arr.shape[1], xc + int(20 * scale))
         strip = arr[:, xc:xe, :]
         rd = (strip.min(axis=2) < 150).any(axis=1)
-        t = []; in_g = False
+        thumbs = []; in_g = False
         for i, v in enumerate(rd):
             y = i / scale
             if v and not in_g: in_g = True; t0 = y
             elif not v and in_g:
                 in_g = False
-                if y - t0 > 8: t.append(t0)
-        if len(t) >= len(best) and len(t) >= int(n * 0.5):
-            best = t
+                if y - t0 > 8: thumbs.append(t0)
+        if len(thumbs) > len(best): best = thumbs
     return best
 
 def fix_pdf(pdf_bytes):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    OX = 86.0; PX = 27.5; W = 22.5; H2 = 24.67
+    ANCHO = 22.5; ALTO = 24.67
     total = 0; log = []
 
     for pi in range(len(doc)):
-        page = doc[pi]; H = page.rect.height
+        page = doc[pi]
+        H = page.rect.height; W = page.rect.width
+        scale = 3
         arr = np.array(Image.open(
-            io.BytesIO(page.get_pixmap(matrix=fitz.Matrix(3, 3)).tobytes("png"))
+            io.BytesIO(page.get_pixmap(matrix=fitz.Matrix(scale, scale)).tobytes("png"))
         ))
-        lks = page.get_links()
-        if not lks: continue
+
+        links = page.get_links()
+        if not links: continue
 
         rows = {}
-        for l in lks:
-            r = l["from"]; k = round(r.y0, 2)
+        for lnk in links:
+            r = lnk["from"]; k = round(r.y0, 2)
             if k not in rows: rows[k] = []
             rows[k].append(r)
-        sy = sorted(rows.keys())
+        sorted_ys = sorted(rows.keys())
 
-        ty = get_thumbs(arr, rows[sy[0]][0].x0 + OX, W, 3, len(sy))
-        if not ty:
-            log.append(f"P{pi+1}: sin thumbs"); continue
+        # Detectar X de thumbnails desde la imagen
+        x_cols = detect_thumb_x_columns(arr, scale, W)
+        if not x_cols:
+            log.append(f"P{pi+1}: sin columnas X"); continue
+        x0_thumb = x_cols[0] - ANCHO / 2
+        paso_x = (x_cols[1] - x_cols[0]) if len(x_cols) > 1 else 27.5
 
-        paso = (ty[-1] - ty[0]) / (len(ty) - 1) if len(ty) > 1 else 32.5
-        while len(ty) < len(sy): ty.append(ty[-1] + paso)
+        # Detectar Y de thumbnails desde la imagen
+        thumbs_y = detect_thumb_y_rows(arr, scale, x_cols)
+        if not thumbs_y:
+            log.append(f"P{pi+1}: sin filas Y"); continue
 
+        paso_y = (thumbs_y[-1]-thumbs_y[0])/(len(thumbs_y)-1) if len(thumbs_y) > 1 else 32.5
+        while len(thumbs_y) < len(sorted_ys):
+            thumbs_y.append(thumbs_y[-1] + paso_y)
+
+        # Modificar Rects via page object
         px = page.xref; po = doc.xref_object(px)
         rr = re.compile(r"/Rect \[ ([0-9.\-]+) ([0-9.\-]+) ([0-9.\-]+) ([0-9.\-]+) \]")
         parsed = [
@@ -68,13 +91,13 @@ def fix_pdf(pdf_bytes):
         syt = sorted(ro.keys(), reverse=True)
 
         npo = po; rep = 0
-        for ri, (yl, yk) in enumerate(zip(sy, syt)):
-            if ri >= len(ty): break
-            ytp = H - ty[ri]; ybp = ytp - H2
+        for ri, (yl, yk) in enumerate(zip(sorted_ys, syt)):
+            if ri >= len(thumbs_y): break
+            ytp = H - thumbs_y[ri]; ybp = ytp - ALTO
             rrow = sorted(ro[yk], key=lambda p: p["x0"])
-            x0r = rows[yl][0].x0
             for ci, p in enumerate(rrow):
-                nx0 = x0r + OX + ci * PX; nx1 = nx0 + W
+                nx0 = x0_thumb + ci * paso_x
+                nx1 = nx0 + ANCHO
                 os = p["m"].group(0)
                 ns = f"/Rect [ {nx0:.4f} {ytp:.4f} {nx1:.4f} {ybp:.4f} ]"
                 npo = npo.replace(os, ns, 1); rep += 1
@@ -82,7 +105,7 @@ def fix_pdf(pdf_bytes):
         if rep > 0:
             doc.update_object(px, npo)
             total += rep
-            log.append(f"P{pi+1}: {rep} enlaces")
+            log.append(f"P{pi+1}: {rep} enlaces ({len(thumbs_y)} filas)")
 
     out = io.BytesIO()
     doc.save(out)
@@ -94,10 +117,9 @@ def fix_endpoint():
         return "", 204
     try:
         data = request.get_json()
-        pdf_b64 = data.get("pdf")
-        if not pdf_b64:
+        if not data or not data.get("pdf"):
             return jsonify({"error": "No PDF provided"}), 400
-        pdf_bytes = base64.b64decode(pdf_b64)
+        pdf_bytes = base64.b64decode(data["pdf"])
         fixed_bytes, total, log = fix_pdf(pdf_bytes)
         return jsonify({
             "pdf": base64.b64encode(fixed_bytes).decode(),
@@ -105,13 +127,13 @@ def fix_endpoint():
             "log": log
         })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-500:]}), 500
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": "2.0-imgdetect"})
 
 if __name__ == "__main__":
     import os
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
